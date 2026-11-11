@@ -10,11 +10,13 @@ use Illuminate\Support\Facades\Auth;
 use Tymon\JWTAuth\Facades\JWTAuth;
 use Illuminate\Support\Facades\Hash;
 use App\Helper\_EmailHelper;
+use App\Services\AdministratorNotificationService;
+use App\Services\AuthSessionService;
 
 class AuthController extends Controller
 {
     // Login Function
-    public function login(Request $request)
+    public function login(Request $request, AuthSessionService $sessions)
 {
     $request->validate([
         'email' => 'required|email',
@@ -42,28 +44,8 @@ class AuthController extends Controller
         ], 403);
     }
 
-    $refreshToken = $this->createRefreshToken($user);
-
-    // ✅ Define Access Type Formatting
-    $accessTypes = [
-        'R' => ['label' => 'Read Only', 'class' => 'r'],
-        'RW' => ['label' => 'Read & Write', 'class' => 'rw'],
-        'RWED' => ['label' => 'Read, Write, Edit & Delete', 'class' => 'rwed'],
-        'FULL' => ['label' => 'Admin', 'class' => 'full'],
-    ];
-    $accessType = $accessTypes[$user->access_type] ?? ['label' => 'Unknown', 'class' => 'r'];
-
-    // ✅ Prepare Email Data
-    $data = [
-        'user_name' => $user->name,
-        'user_email' => $user->email,
-        'login_time' => now()->format('Y-m-d H:i:s'),
-        'access_label' => $accessType['label'],
-        'access_class' => $accessType['class'],
-    ];
-
-    // ✅ Send Email (No change to `_EmailHelper.php`)
-    _EmailHelper::sendEmail($data, 'emails.login');
+    $refreshToken = $sessions->createRefreshToken($user);
+    $sessions->notifyAdministratorsOfLogin($user);
 
     return response()->json([
         'data' => [
@@ -102,6 +84,18 @@ class AuthController extends Controller
     
         // Retrieve the user associated with the refresh token
         $user = $refreshToken->user;
+
+        if (!$user || $user->is_banned) {
+            $refreshToken->delete();
+
+            return response()->json([
+                'code' => 'ACCOUNT_SUSPENDED',
+                'data' => null,
+                'status_code' => 403,
+                'message' => 'Your account has been suspended.',
+                'status' => false,
+            ], 403);
+        }
     
         // Generate a new access token for the user
         $newAccessToken = JWTAuth::fromUser($user);
@@ -120,20 +114,6 @@ class AuthController extends Controller
     }
     
 
-    // Helper method to create a refresh token
-    protected function createRefreshToken(User $user)
-    {
-        $token = bin2hex(random_bytes(64)); // Generate a secure token
-        $expiresAt = now()->addMinute(60); // Set expiration to 30 days
-
-        RefreshToken::create([
-            'user_id' => $user->id,
-            'token' => $token,
-            'expires_at' => $expiresAt,
-        ]);
-
-        return $token;
-    }
     public function getUserDetails(Request $request)
     {
         // Retrieve the authenticated user
@@ -147,8 +127,15 @@ class AuthController extends Controller
                 'status_code' => 401,
             ], 401);
         }
-    
+
         // Return user details
+        $user->unsetRelation('role')->load('role.permissions:id,name,label,group,subgroup');
+        $effectivePermissions = $user->role
+            ? ($user->role->is_super_admin
+                ? \App\Models\Permission::orderBy('id')->get(['id', 'name', 'label', 'group', 'subgroup'])
+                : $user->role->permissions->values())
+            : collect([]);
+
         return response()->json([
             'status' => true,
             'message' => 'User details retrieved successfully',
@@ -159,16 +146,35 @@ class AuthController extends Controller
                 'email' => $user->email,
                 'is_banned'=>$user->is_banned,
                 'access_type'=>$user->access_type,
+                'role' => $user->role ? [
+                    'id' => $user->role->id,
+                    'name' => $user->role->name,
+                    'label' => $user->role->label,
+                    'is_super_admin' => $user->role->is_super_admin,
+                    'permissions' => $effectivePermissions,
+                ] : null,
+                'permissions' => $effectivePermissions,
+                'email_verified_at' => $user->email_verified_at?->toISOString(),
+                'receive_notification' => $user->receive_notification,
+                'auth_provider' => $user->auth_provider,
+                'microsoft_connected' => filled($user->microsoft_oid),
+                'last_microsoft_login_at' => $user->last_microsoft_login_at?->toISOString(),
                 'password'=>'',
                 'created_at' => $user->created_at?->toDateTimeString() ?? 'N/A', // Handle null
                 'updated_at' => $user->updated_at?->toDateTimeString() ?? 'N/A', // Handle null
             ],
-        ]);
+        ])->header('Cache-Control', 'no-store, private');
     }
 
     public function logout(Request $request)
     {
         try {
+            if ($request->filled('refresh_token')) {
+                RefreshToken::where('token', $request->input('refresh_token'))
+                    ->where('user_id', $request->user()?->id)
+                    ->delete();
+            }
+
             JWTAuth::invalidate(JWTAuth::getToken());
             return response()->json([
                 'data' => null,
@@ -192,15 +198,15 @@ class AuthController extends Controller
         $request->validate([
             'is_banned' => 'required|boolean',
         ]);
-        $user = Auth::user();
+        $actor = Auth::user();
 
-        if (!in_array($user->access_type, ['FULL'])) {
+        if (!$actor || ! $actor->hasPermission('users.ban')) {
             return response()->json([
                 'data' => null,
-                'status_code' => 404,
-                'message' => 'You do not have permission to Export data.',
+                'status_code' => 403,
+                'message' => 'You do not have permission to manage users.',
                 'status' => false,
-            ], 404);
+            ], 403);
         }
         // Find the user by ID
         $user = User::find($userId);
@@ -213,6 +219,33 @@ class AuthController extends Controller
                 'message' => 'User not found',
                 'status' => false,
             ], 404);
+        }
+
+        if ($actor->id === $user->id && $request->boolean('is_banned')) {
+            return response()->json([
+                'data' => null,
+                'status_code' => 422,
+                'message' => 'You cannot ban your own account.',
+                'status' => false,
+            ], 422);
+        }
+
+        if (
+            $request->boolean('is_banned')
+            && ($user->role?->is_super_admin || $user->access_type === 'FULL')
+            && !$user->is_banned
+            && User::where('is_banned', false)
+                ->where(function ($query) {
+                    $query->where('access_type', 'FULL')
+                        ->orWhereHas('role', fn ($role) => $role->where('is_super_admin', true));
+                })->count() <= 1
+        ) {
+            return response()->json([
+                'data' => null,
+                'status_code' => 422,
+                'message' => 'The last active administrator cannot be banned.',
+                'status' => false,
+            ], 422);
         }
     
         // Update the is_banned status
@@ -249,7 +282,7 @@ class AuthController extends Controller
         _EmailHelper::sendEmail($data, 'emails.ban_status');
         // Return success response
         return response()->json([
-            'data' => $user,
+            'data' => $user->fresh()->load('role:id,name,label,is_super_admin'),
             'status_code' => 200,
             'message' => 'User ban status updated successfully',
             'status' => true,
@@ -258,9 +291,18 @@ class AuthController extends Controller
     
     public function updateProfile(Request $request,$userId)
 {
+    $actor = $request->user();
+    if (!$actor || ($actor->id !== (int) $userId && ! $actor->hasPermission('users.edit'))) {
+        return response()->json([
+            'data' => null,
+            'status_code' => 403,
+            'message' => 'You do not have permission to update this profile.',
+            'status' => false,
+        ], 403);
+    }
+
     // Validate the input
     $request->validate([
-        'email' => 'required|email|unique:users,email,', // Ensure email is unique
         'name' => 'required|string|max:255',
     ]);
 
@@ -268,15 +310,14 @@ class AuthController extends Controller
     $user = User::find($userId);
 
     // Update the email and name
-    $user->email = $request->email;
     $user->name = $request->name;
     $user->save();
     $accessTypes = [
         'R' => ['label' => 'Read Only', 'class' => 'r'],
-        'RW' => ['label' => 'Read & Write', 'class' => 'rw'],
-        'RWE' => ['label' => 'Read , Write & Edit', 'class' => 'rwe'],
-        'RWED' => ['label' => 'Read, Write, Edit & Delete', 'class' => 'rwed'],
-        'FULL' => ['label' => 'Admin', 'class' => 'full'],
+        'RW' => ['label' => 'Read, import & export', 'class' => 'rw'],
+        'RWE' => ['label' => 'Read, import, export & edit', 'class' => 'rwe'],
+        'RWED' => ['label' => 'Read, import, export, edit, delete & restore', 'class' => 'rwed'],
+        'FULL' => ['label' => 'Administrator', 'class' => 'full'],
     ];
     $accessType = $accessTypes[$user->access_type] ?? ['label' => 'Unknown', 'class' => 'r'];
 
@@ -309,23 +350,34 @@ class AuthController extends Controller
 
 public function updatePassword(Request $request,$userId)
 {
+    $actor = $request->user();
+    if (!$actor || ($actor->id !== (int) $userId && ! $actor->hasPermission('users.edit'))) {
+        return response()->json([
+            'data' => null,
+            'status_code' => 403,
+            'message' => 'You do not have permission to update this password.',
+            'status' => false,
+        ], 403);
+    }
+
     // Validate the request
     $request->validate([
-        'password' => 'required|string|min:3',
+        'current_password' => 'required|string',
+        'password' => 'required|string|min:12|confirmed',
     ]);
 
     // Get the authenticated user
     $user = User::find($userId);
 
-    // Check if the current password matches
-    // if (!Hash::check($request->current_password, $user->password)) {
-    //     return response()->json([
-    //         'data' => null,
-    //         'status_code' => 400,
-    //         'message' => 'Current password is incorrect',
-    //         'status' => false,
-    //     ], 400);
-    // }
+    if (!Hash::check($request->current_password, $user->password)) {
+        return response()->json([
+            'data' => null,
+            'status_code' => 422,
+            'message' => 'The current password is incorrect.',
+            'errors' => ['current_password' => ['The current password is incorrect.']],
+            'status' => false,
+        ], 422);
+    }
 
     // Update the user's password
     $user->password = Hash::make($request->password);
@@ -341,28 +393,79 @@ public function updatePassword(Request $request,$userId)
 }
 
 
-public function updateName(Request $request, $userId)
+public function updateName(Request $request, $userId, AdministratorNotificationService $notifications)
 {
+    $actor = $request->user();
+    if (!$actor || ! $actor->hasPermission('users.edit')) {
+        return response()->json([
+            'data' => null,
+            'status_code' => 403,
+            'message' => 'You do not have permission to update users.',
+            'status' => false,
+        ], 403);
+    }
+
     // Validate the request
     $request->validate([
         'name' => 'required|string|max:255',
+        'email' => 'required|email|max:255|unique:users,email,' . $userId,
         'access_type' => 'sometimes|in:R,RW,RWE,RWED,FULL', // ✅ Validate access_type if provided
     ]);
+
+    if ($request->filled('access_type') && ! $actor->hasPermission('users.assign_roles')) {
+        return response()->json([
+            'data' => null,
+            'status_code' => 403,
+            'message' => 'You do not have permission to assign roles.',
+            'status' => false,
+        ], 403);
+    }
 
     // Find the user or fail
     $user = User::findOrFail($userId);
 
+    if (
+        $user->access_type === 'FULL'
+        && !$user->is_banned
+        && $request->input('access_type', $user->access_type) !== 'FULL'
+        && User::where('access_type', 'FULL')->where('is_banned', false)->count() <= 1
+    ) {
+        return response()->json([
+            'data' => null,
+            'status_code' => 422,
+            'message' => 'The last active administrator cannot be demoted.',
+            'status' => false,
+        ], 422);
+    }
+
+    $becameAdministrator = $user->access_type !== 'FULL'
+        && $request->input('access_type', $user->access_type) === 'FULL';
+
+    $legacyRole = $request->filled('access_type')
+        ? \App\Models\Role::where('name', [
+            'R' => 'viewer', 'RW' => 'contact_importer', 'RWE' => 'contact_editor',
+            'RWED' => 'contact_manager', 'FULL' => 'super_administrator',
+        ][$request->input('access_type')])->first()
+        : null;
+
     // Update user details
     $user->update([
         'name' => $request->name,
+        'email' => $request->email,
         'access_type' => $request->access_type ?? $user->access_type, // ✅ Update access_type if provided
+        'role_id' => $legacyRole?->id ?? $user->role_id,
     ]);
+
+    if ($becameAdministrator && $user->email_verified_at !== null) {
+        $user->update(['receive_notification' => true]);
+        $notifications->sendEnabledNotice($user);
+    }
     $accessTypes = [
         'R' => ['label' => 'Read Only', 'class' => 'r'],
-        'RW' => ['label' => 'Read & Write', 'class' => 'rw'],
-        'RWE' => ['label' => 'Read , Write & Edit', 'class' => 'rwe'],
-        'RWED' => ['label' => 'Read, Write, Edit & Delete', 'class' => 'rwed'],
-        'FULL' => ['label' => 'Admin', 'class' => 'full'],
+        'RW' => ['label' => 'Read, import & export', 'class' => 'rw'],
+        'RWE' => ['label' => 'Read, import, export & edit', 'class' => 'rwe'],
+        'RWED' => ['label' => 'Read, import, export, edit, delete & restore', 'class' => 'rwed'],
+        'FULL' => ['label' => 'Administrator', 'class' => 'full'],
     ];
     $accessType = $accessTypes[$user->access_type] ?? ['label' => 'Unknown', 'class' => 'r'];
 

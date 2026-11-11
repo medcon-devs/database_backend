@@ -1,73 +1,79 @@
 <?php
+
 namespace App\Exports;
 
 use App\Models\CSVData;
+use Illuminate\Database\Eloquent\Builder;
+use Illuminate\Support\Collection;
 use Maatwebsite\Excel\Concerns\FromCollection;
-use Maatwebsite\Excel\Concerns\WithHeadings;
 use Maatwebsite\Excel\Concerns\ShouldAutoSize;
+use Maatwebsite\Excel\Concerns\WithHeadings;
 
-class CSVDataExport implements FromCollection, WithHeadings, ShouldAutoSize
+class CSVDataExport implements FromCollection, ShouldAutoSize, WithHeadings
 {
-    protected $countries;
-    protected $specialities;
-    protected $userId;
-    protected $text;
+    public function __construct(
+        protected int $userId,
+        protected array $countries = [],
+        protected array $specialities = [],
+        protected string $text = '',
+        protected array $includeTagIds = [],
+        protected array $excludeTagIds = [],
+        protected string $sortBy = 'created_at',
+        protected string $sortDirection = 'desc',
+        protected ?string $tenantId = null,
+        protected bool $scopeTenant = false
+    ) {}
 
-    public function __construct($userId, $countries = [], $specialities = [], $text = '')
+    public function collection(): Collection
     {
-        $this->userId = $userId;
-        $this->countries = $countries;
-        $this->specialities = $specialities;
-        $this->text = $text;
-    }
-
-    public function collection()
-    {
-        // Query with filters: user_id, countries, specialities, and text search
-        // $query = CSVData::query()
-        //     ->where('user_id', $this->userId) // Filter by user_id from token
-        //     ->when(!empty($this->countries), function ($query) {
-        //         $query->whereIn('country', $this->countries);
-        //     })
-        //     ->when(!empty($this->specialities), function ($query) {
-        //         $query->whereIn('speciality', $this->specialities);
-        //     })
-        //     ->when(!empty($this->text), function ($query) {
-        //         $query->where(function ($subQuery) {
-        //             $subQuery->where('email', 'LIKE', '%' . $this->text . '%')
-        //                 ->orWhere('firstname', 'LIKE', '%' . $this->text . '%')
-        //                 ->orWhere('lastname', 'LIKE', '%' . $this->text . '%');
-        //         });
-        //     })
-        //     ->get();
-
-        $query = CSVData::query() // Match queryRow behavior
-        ->when(!empty($this->text), function ($query) {
-            $query->where(function ($subQuery) {
-                $subQuery->where('email', 'LIKE', '%' . $this->text . '%')
-                    ->orWhere('firstname', 'LIKE', '%' . $this->text . '%')
-                    ->orWhere('lastname', 'LIKE', '%' . $this->text . '%');
-            });
-        })
-        ->when(!empty($this->countries), function ($query) {
-            $query->whereIn('country', $this->countries);
-        })
-        ->when(!empty($this->specialities), function ($query) {
-            $query->whereIn('speciality', $this->specialities);
-        })
-        ->orderBy('created_at', 'desc')
-        ->get();
-
-        // Map the data to include only required fields
-        return $query->map(function ($csvData) {
-            return [
+        return $this->query()
+            ->orderBy($this->sortBy, $this->sortDirection)
+            ->when($this->sortBy !== 'id', fn (Builder $query) => $query->orderBy('id'))
+            ->get()
+            ->map(fn (CSVData $csvData) => [
                 'First Name' => $csvData->firstname,
                 'Last Name' => $csvData->lastname,
                 'Email' => $csvData->email,
+                'Phone' => $csvData->phone,
                 'Country' => $csvData->country,
                 'Speciality' => $csvData->speciality,
-            ];
-        });
+            ]);
+    }
+
+    public function count(): int
+    {
+        return $this->query()->count();
+    }
+
+    public function query(): Builder
+    {
+        return CSVData::query()
+            ->when($this->scopeTenant && $this->tenantId === null, fn (Builder $query) => $query->whereNull('microsoft_tenant_id'))
+            ->when($this->scopeTenant && $this->tenantId !== null, fn (Builder $query) => $query->where('microsoft_tenant_id', $this->tenantId))
+            ->when($this->text !== '', function (Builder $query) {
+                $query->where(function (Builder $query) {
+                    $query->where('email', 'like', '%'.$this->text.'%')
+                        ->orWhere('firstname', 'like', '%'.$this->text.'%')
+                        ->orWhere('lastname', 'like', '%'.$this->text.'%')
+                        ->orWhere('phone', 'like', '%'.$this->text.'%');
+                });
+            })
+            ->when($this->countries !== [], function (Builder $query) {
+                $this->applyNullableFilter($query, 'country', $this->countries);
+            })
+            ->when($this->specialities !== [], function (Builder $query) {
+                $this->applyNullableFilter($query, 'speciality', $this->specialities);
+            })
+            ->when($this->includeTagIds !== [], function (Builder $query) {
+                $query->whereHas('tags', function (Builder $tagQuery) {
+                    $tagQuery->whereIn('tags.id', $this->includeTagIds);
+                });
+            })
+            ->when($this->excludeTagIds !== [], function (Builder $query) {
+                $query->whereDoesntHave('tags', function (Builder $tagQuery) {
+                    $tagQuery->whereIn('tags.id', $this->excludeTagIds);
+                });
+            });
     }
 
     public function headings(): array
@@ -76,8 +82,24 @@ class CSVDataExport implements FromCollection, WithHeadings, ShouldAutoSize
             'FIRST NAME',
             'LAST NAME',
             'EMAIL',
+            'PHONE',
             'COUNTRY',
             'SPECIALITY',
         ];
+    }
+
+    private function applyNullableFilter(Builder $query, string $column, array $values): void
+    {
+        $query->where(function (Builder $query) use ($column, $values) {
+            $nonEmptyValues = array_values(array_filter($values, fn ($value) => $value !== ''));
+
+            if ($nonEmptyValues !== []) {
+                $query->whereIn($column, $nonEmptyValues);
+            }
+
+            if (in_array('', $values, true)) {
+                $query->orWhereNull($column)->orWhere($column, '');
+            }
+        });
     }
 }

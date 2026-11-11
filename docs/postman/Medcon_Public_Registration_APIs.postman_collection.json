@@ -1,0 +1,218 @@
+{
+  "info": {
+    "_postman_id": "6e4af6b7-2180-4a71-93a8-eac24731f197",
+    "name": "Medcon Public Registration APIs",
+    "description": "Professional integration collection for recording WhatsApp consent and submitting webinar/contact registrations to Medcon's isolated staging table. These public endpoints do not require an administrator JWT. Contact submissions never write directly to the main contacts table; an administrator must review and migrate them.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "auth": {
+    "type": "noauth"
+  },
+  "variable": [
+    {
+      "key": "base_url",
+      "value": "https://api-database.medcon.ae/api",
+      "type": "string"
+    },
+    {
+      "key": "source_domain",
+      "value": "webinar.medcon.ae",
+      "type": "string"
+    },
+    {
+      "key": "phone",
+      "value": "+971501234567",
+      "type": "string"
+    },
+    {
+      "key": "email",
+      "value": "doctor@example.com",
+      "type": "string"
+    }
+  ],
+  "item": [
+    {
+      "name": "WhatsApp Consent",
+      "description": "Records auditable WhatsApp marketing consent. A phone without a country code is treated as a UAE number; international numbers should include their country code.",
+      "item": [
+        {
+          "name": "Record WhatsApp Opt-in",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('HTTP 200 returned', () => pm.response.to.have.status(200));",
+                  "pm.test('Response is JSON', () => pm.response.to.be.json);",
+                  "const body = pm.response.json();",
+                  "pm.test('Consent was recorded', () => {",
+                  "  pm.expect(body.status).to.eql(true);",
+                  "  pm.expect(body.data.status).to.eql('opted_in');",
+                  "  pm.expect(body.data.scope).to.eql('marketing');",
+                  "  pm.expect(body.data.source).to.eql('external_api');",
+                  "  pm.expect(body.data.source_domain).to.eql(pm.variables.get('source_domain').toLowerCase());",
+                  "});",
+                  "pm.collectionVariables.set('normalized_phone', body.data.phone);"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Accept", "value": "application/json", "type": "text" },
+              { "key": "Content-Type", "value": "application/json", "type": "text" },
+              { "key": "Origin", "value": "https://{{source_domain}}", "type": "text" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"phone\": \"{{phone}}\",\n  \"action\": \"opt_in\",\n  \"source_domain\": \"{{source_domain}}\",\n  \"consent_text\": \"I agree to receive event updates and marketing messages from Medcon through WhatsApp.\",\n  \"consent_version\": \"1.0\",\n  \"evidence_reference\": \"registration-{{$guid}}\"\n}",
+              "options": { "raw": { "language": "json" } }
+            },
+            "url": {
+              "raw": "{{base_url}}/v1/whatsapp/consents",
+              "host": ["{{base_url}}"],
+              "path": ["v1", "whatsapp", "consents"]
+            },
+            "description": "Call only after the user actively selects a clear WhatsApp consent checkbox. `consent_text` is required for opt-in. Use a stable evidence reference, such as the webinar registration ID, to make retries idempotent."
+          },
+          "response": [
+            {
+              "name": "Opt-in recorded",
+              "originalRequest": {
+                "method": "POST",
+                "header": [
+                  { "key": "Accept", "value": "application/json" },
+                  { "key": "Content-Type", "value": "application/json" }
+                ],
+                "body": {
+                  "mode": "raw",
+                  "raw": "{\n  \"phone\": \"+971501234567\",\n  \"action\": \"opt_in\",\n  \"source_domain\": \"webinar.medcon.ae\",\n  \"consent_text\": \"I agree to receive event updates and marketing messages from Medcon through WhatsApp.\",\n  \"consent_version\": \"1.0\",\n  \"evidence_reference\": \"registration-98421\"\n}"
+                },
+                "url": { "raw": "{{base_url}}/v1/whatsapp/consents", "host": ["{{base_url}}"], "path": ["v1", "whatsapp", "consents"] }
+              },
+              "status": "OK",
+              "code": 200,
+              "_postman_previewlanguage": "json",
+              "header": [{ "key": "Content-Type", "value": "application/json" }],
+              "cookie": [],
+              "body": "{\n  \"data\": {\n    \"phone\": \"971501234567\",\n    \"status\": \"opted_in\",\n    \"scope\": \"marketing\",\n    \"source\": \"external_api\",\n    \"source_domain\": \"webinar.medcon.ae\",\n    \"consent_version\": \"1.0\",\n    \"evidence_reference\": \"registration-98421\",\n    \"opted_in_at\": \"2026-08-06T12:00:00.000000Z\",\n    \"opted_out_at\": null\n  },\n  \"status_code\": 200,\n  \"message\": \"WhatsApp opt-in recorded successfully.\",\n  \"status\": true\n}"
+            }
+          ]
+        },
+        {
+          "name": "Record WhatsApp Opt-out",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('HTTP 200 returned', () => pm.response.to.have.status(200));",
+                  "const body = pm.response.json();",
+                  "pm.test('Opt-out was recorded', () => {",
+                  "  pm.expect(body.status).to.eql(true);",
+                  "  pm.expect(body.data.status).to.eql('opted_out');",
+                  "  pm.expect(body.data.opted_out_at).to.not.eql(null);",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Accept", "value": "application/json" },
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Origin", "value": "https://{{source_domain}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"phone\": \"{{phone}}\",\n  \"action\": \"opt_out\",\n  \"source_domain\": \"{{source_domain}}\",\n  \"consent_version\": \"1.0\",\n  \"evidence_reference\": \"unsubscribe-{{$guid}}\"\n}",
+              "options": { "raw": { "language": "json" } }
+            },
+            "url": {
+              "raw": "{{base_url}}/v1/whatsapp/consents",
+              "host": ["{{base_url}}"],
+              "path": ["v1", "whatsapp", "consents"]
+            },
+            "description": "Records withdrawal of WhatsApp marketing consent. `consent_text` is not required for opt-out."
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "Contact Submissions",
+      "description": "Submits registrations to an isolated pending table. The main contact database remains unchanged until a FULL administrator reviews and migrates the submission.",
+      "item": [
+        {
+          "name": "Submit Contact for Review",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('HTTP 202 Accepted returned', () => pm.response.to.have.status(202));",
+                  "pm.test('Response is JSON', () => pm.response.to.be.json);",
+                  "const body = pm.response.json();",
+                  "pm.test('Submission is pending administrator review', () => {",
+                  "  pm.expect(body.status).to.eql(true);",
+                  "  pm.expect(body.data.status).to.eql('pending');",
+                  "  pm.expect(['new', 'update']).to.include(body.data.submission_type);",
+                  "  pm.expect(body.data.submission_id).to.be.a('number');",
+                  "});",
+                  "pm.collectionVariables.set('submission_id', String(body.data.submission_id));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Accept", "value": "application/json" },
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Origin", "value": "https://{{source_domain}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"source_domain\": \"{{source_domain}}\",\n  \"external_reference\": \"webinar-registration-{{$guid}}\",\n  \"firstname\": \"Majd\",\n  \"lastname\": \"Ahmad\",\n  \"email\": \"{{email}}\",\n  \"phone\": \"{{phone}}\",\n  \"country\": \"United Arab Emirates\",\n  \"speciality\": \"Cardiology\",\n  \"metadata\": {\n    \"webinar_id\": 45,\n    \"webinar_name\": \"Cardiology Update 2026\",\n    \"registration_source\": \"website\"\n  }\n}",
+              "options": { "raw": { "language": "json" } }
+            },
+            "url": {
+              "raw": "{{base_url}}/v1/contact-submissions",
+              "host": ["{{base_url}}"],
+              "path": ["v1", "contact-submissions"]
+            },
+            "description": "Required: source_domain, firstname, lastname, email, speciality. Optional: external_reference, phone, country, metadata. The same source_domain + external_reference can be safely retried without creating duplicate staging records."
+          },
+          "response": [
+            {
+              "name": "Queued for review",
+              "originalRequest": {
+                "method": "POST",
+                "header": [
+                  { "key": "Accept", "value": "application/json" },
+                  { "key": "Content-Type", "value": "application/json" }
+                ],
+                "body": {
+                  "mode": "raw",
+                  "raw": "{\n  \"source_domain\": \"webinar.medcon.ae\",\n  \"external_reference\": \"webinar-registration-98421\",\n  \"firstname\": \"Majd\",\n  \"lastname\": \"Ahmad\",\n  \"email\": \"majd@example.com\",\n  \"phone\": \"+971501234567\",\n  \"country\": \"United Arab Emirates\",\n  \"speciality\": \"Cardiology\",\n  \"metadata\": { \"webinar_id\": 45 }\n}"
+                },
+                "url": { "raw": "{{base_url}}/v1/contact-submissions", "host": ["{{base_url}}"], "path": ["v1", "contact-submissions"] }
+              },
+              "status": "Accepted",
+              "code": 202,
+              "_postman_previewlanguage": "json",
+              "header": [{ "key": "Content-Type", "value": "application/json" }],
+              "cookie": [],
+              "body": "{\n  \"data\": {\n    \"submission_id\": 123,\n    \"status\": \"pending\",\n    \"submission_type\": \"new\"\n  },\n  \"status_code\": 202,\n  \"message\": \"Contact data received and queued for administrator review.\",\n  \"status\": true\n}"
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

@@ -2,74 +2,88 @@
 
 namespace App\Helper;
 
+use App\Models\User;
 use Illuminate\Support\Facades\Log;
-use Illuminate\Support\Facades\View;
-use PHPMailer\PHPMailer\PHPMailer;
-use PHPMailer\PHPMailer\Exception;
-
-// Manually load PHPMailer since it's not installed via Composer
-require_once __DIR__ . '/../../vendor/PHPMailer/src/PHPMailer.php';
-require_once __DIR__ . '/../../vendor/PHPMailer/src/SMTP.php';
-require_once __DIR__ . '/../../vendor/PHPMailer/src/Exception.php';
+use Illuminate\Support\Facades\Mail;
+use Throwable;
 
 class _EmailHelper
-{   
-    /**
-     * Get configured PHPMailer instance
-     */
-    public static function getPHPMailer(): PHPMailer
-    {
-        $mail = new PHPMailer(true);
-        $mail->isSMTP();
-        $mail->Host = 'smtp.dreamhost.com'; // ✅ Double-check this
-        $mail->SMTPAuth = true;
-        $mail->Username = 'info@database.medcon.ae'; // ✅ Your full email
-        $mail->Password = 'Medcon@23'; // ✅ Your correct email password
-        $mail->SMTPSecure = PHPMailer::ENCRYPTION_STARTTLS; // 🔥 Change from SMTPS to STARTTLS
-        $mail->Port = 587; // 🔥 Change from 465 to 587
-        $mail->Debugoutput = function ($str, $level) { Log::info("SMTP Debug: $str"); };
-        return $mail;
-    }
+{
+    private const SUBJECTS = [
+        'emails.welcome_user' => 'Welcome to Medcon Database — Set your password',
+        'emails.forgot_password' => 'Reset your Medcon Database password',
+        'emails.administrator_notifications_enabled' => 'Administrator activity notifications are enabled',
+        'emails.new_user' => 'New Medcon Database user created',
+        'emails.login' => 'Medcon Database sign-in notification',
+        'emails.ban_status' => 'Medcon Database account status changed',
+        'emails.profile_update' => 'Medcon Database profile updated',
+        'emails.upload' => 'Medcon Database import completed',
+        'emails.restore' => 'Medcon Database contact restored',
+        'emails.update' => 'Medcon Database contact updated',
+        'emails.delete' => 'Medcon Database contact deleted',
+        'emails.contact_media' => 'Medcon Database contact file activity',
+        'emails.export' => 'Medcon Database export completed',
+        'emails.sample' => 'Medcon Database email test',
+    ];
 
     /**
-     * Send an email using PHPMailer and DreamHost SMTP
+     * Send a rendered Blade email through Laravel's configured mail transport.
+     * Operational notifications go to every opted-in, verified administrator.
+     * User-facing messages must pass the recipient explicitly.
      */
-    public static function sendEmail( $data, $view)
-    {
-        Log::info("---------------------------------------------------------");
-        try {
-            $mail = self::getPHPMailer();
-            $mail->setFrom('info@database.medcon.ae', 'Medcon-Database');
-            $mail->addReplyTo('info@database.medcon.ae', 'Medcon-Database');
-            $mail->addAddress("majd.a@medcon-me.com");
-            $mail->SMTPOptions = [
-                'ssl' => [
-                    'verify_peer' => false,
-                    'verify_peer_name' => false,
-                    'allow_self_signed' => true,
-                ],
-            ];
-            // ✅ Set email headers
-            $mail->Priority = 3;
-            $mail->CharSet = 'UTF-8';
-            $mail->Encoding = 'base64';
-            $mail->isHTML(true);
-            $mail->Subject = 'DataBase Security';
-            
-            // ✅ Render Laravel Blade template as email body
-            $mail->Body = View::make($view, $data)->render();
+    public static function sendEmail(
+        array $data,
+        string $view,
+        ?string $recipient = null,
+        ?string $subject = null,
+        ?int $excludedUserId = null
+    ): bool {
+        $isOperationalNotification = $recipient === null;
+        $recipients = $recipient
+            ? collect([$recipient])
+            : User::notificationAdministrators()
+                ->when($excludedUserId !== null, fn ($query) => $query->whereKeyNot($excludedUserId))
+                ->pluck('email');
 
-            // ✅ Attempt to send email
-            if (!$mail->send()) {
-                Log::error("Email sending failed: " . $mail->ErrorInfo);
-                return false;
-            }
-
-            Log::info("Email sent successfully");
-            return true;
-        } catch (Exception $e) {
-            Log::error("Email Error: " . $e->getMessage());
-            return false;
+        if ($isOperationalNotification) {
+            $data['show_notification_preference'] = true;
         }
+
+        if ($recipients->isEmpty()) {
+            Log::info('Email was not sent because there are no eligible recipients.', [
+                'view' => $view,
+            ]);
+
+            return true;
+        }
+
+        $allSent = true;
+        foreach ($recipients->unique() as $email) {
+            try {
+                Mail::send($view, $data, function ($message) use ($email, $subject, $view) {
+                    $message->to($email)
+                        ->subject($subject ?? self::SUBJECTS[$view] ?? 'Medcon Database notification');
+
+                    if (config('mail.support.address')) {
+                        $message->replyTo(config('mail.support.address'), 'Medcon Support');
+                    }
+                });
+
+                Log::info('Email sent successfully.', [
+                    'view' => $view,
+                    'recipient_domain' => str_contains($email, '@')
+                        ? substr(strrchr($email, '@'), 1)
+                        : 'invalid',
+                ]);
+            } catch (Throwable $exception) {
+                $allSent = false;
+                Log::error('Email could not be sent.', [
+                    'view' => $view,
+                    'error' => $exception->getMessage(),
+                ]);
+            }
+        }
+
+        return $allSent;
     }
 }

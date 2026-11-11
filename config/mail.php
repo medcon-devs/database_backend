@@ -41,7 +41,9 @@ return [
             'encryption' => env('MAIL_ENCRYPTION', 'tls'),
             'username' => env('MAIL_USERNAME'),
             'password' => env('MAIL_PASSWORD'),
-            'timeout' => null,
+            // Do not let an unavailable SMTP server hold an API request open
+            // until the reverse proxy returns a 502 response.
+            'timeout' => (int) env('MAIL_TIMEOUT', 10),
             'local_domain' => env('MAIL_EHLO_DOMAIN'),
         ],
 
@@ -95,6 +97,16 @@ return [
         'address' => env('MAIL_FROM_ADDRESS', 'hello@example.com'),
         'name' => env('MAIL_FROM_NAME', 'Example'),
     ],
+
+    'support' => [
+        'address' => env('MAIL_SUPPORT_ADDRESS', env('MAIL_FROM_ADDRESS')),
+    ],
+
+    'footer_contact' => [
+        'address' => env('MAIL_FOOTER_CONTACT_ADDRESS', env('MAIL_SUPPORT_ADDRESS', env('MAIL_FROM_ADDRESS'))),
+    ],
+
+    'application_url' => env('MAIL_APPLICATION_URL', env('FRONTEND_LOGIN_URL', env('APP_URL'))),
 
     /*
     |--------------------------------------------------------------------------

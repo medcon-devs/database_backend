@@ -1,5 +1,6 @@
 <?php
 
+use App\Http\Controllers\SetPasswordController;
 use Illuminate\Support\Facades\Route;
 
 /*
@@ -16,3 +17,10 @@ use Illuminate\Support\Facades\Route;
 Route::get('/', function () {
     return view('welcome');
 });
+
+Route::get('/set-password/{token}', [SetPasswordController::class, 'show'])
+    ->middleware('throttle:20,1')
+    ->name('password.setup.show');
+Route::post('/set-password', [SetPasswordController::class, 'update'])
+    ->middleware('throttle:10,1')
+    ->name('password.setup.update');

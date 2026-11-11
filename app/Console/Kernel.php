@@ -10,12 +10,21 @@ class Kernel extends ConsoleKernel
     /**
      * Define the application's command schedule.
      *
-     * @param  \Illuminate\Console\Scheduling\Schedule  $schedule
      * @return void
      */
     protected function schedule(Schedule $schedule)
     {
-        // $schedule->command('inspire')->hourly();
+        $schedule->command('whatsapp:dispatch-scheduled-campaigns')
+            ->everyMinute()
+            ->withoutOverlapping();
+
+        $schedule->command('contact-media:purge-expired')
+            ->dailyAt('02:30')
+            ->withoutOverlapping();
+
+        $schedule->command('sticky-notes:archive-expired')
+            ->everyMinute()
+            ->withoutOverlapping();
     }
 
     /**

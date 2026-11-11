@@ -13,6 +13,12 @@ return new class extends Migration
      */
     public function up()
     {
+        if (DB::getDriverName() === 'sqlite') {
+            Schema::table('users', function (Blueprint $table) {
+                $table->string('access_type')->default('R')->change();
+            });
+            return;
+        }
         DB::statement("ALTER TABLE users MODIFY access_type ENUM('R', 'RW', 'RWE', 'RWED', 'FULL') DEFAULT 'R'");
     }
 
@@ -23,6 +29,12 @@ return new class extends Migration
      */
     public function down()
     {
+        if (DB::getDriverName() === 'sqlite') {
+            Schema::table('users', function (Blueprint $table) {
+                $table->string('access_type')->default('R')->change();
+            });
+            return;
+        }
         DB::statement("ALTER TABLE users MODIFY access_type ENUM('R', 'RW', 'RWED', 'FULL') DEFAULT 'R'");
     }
 };

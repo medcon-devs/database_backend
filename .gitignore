@@ -16,3 +16,7 @@ yarn-error.log
 /.fleet
 /.idea
 /.vscode
+
+# macOS / generated artifacts
+.DS_Store
+/output

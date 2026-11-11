@@ -2,29 +2,33 @@
 
 namespace App\Http\Controllers;
 
+use App\Exports\CSVDataExport;
+use App\Exceptions\CsvImportException;
+use App\Helper\_EmailHelper;
 use App\Models\CSVData;
-use App\Models\UserActivity;
 use App\Models\HistoryEditing;
+use App\Models\User;
+use App\Models\UserActivity;
+use App\Services\ReferenceDataService;
+use App\Services\ContactSortingService;
+use App\Services\CsvContactImportService;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Auth;
-use Illuminate\Support\Facades\Validator;
-use Maatwebsite\Excel\Facades\Excel;
-use App\Exports\CSVDataExport;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
-use App\Models\User;
-use App\Helper\_EmailHelper;
+use Illuminate\Support\Facades\Validator;
 use Illuminate\Support\Str;
-
+use Illuminate\Validation\Rule;
+use Maatwebsite\Excel\Facades\Excel;
 
 class CSVController extends Controller
 {
-    public function uploadData(Request $request)
+    public function uploadData(Request $request, CsvContactImportService $importer)
     {
         $user = Auth::user(); // Get authenticated user
 
         // Check if the user has permission to upload
-        if (!in_array($user->access_type, ['RW', 'RWED', 'FULL'])) {
+        if (! $user->hasPermission('contacts.import')) {
             return response()->json([
                 'data' => null,
                 'status_code' => 400,
@@ -47,85 +51,74 @@ class CSVController extends Controller
             ], 400);
         }
 
-        $file = $request->file('file');
-        $user_id = $user->id;
+        try {
+            $result = $importer->import($request->file('file'), $user);
+        } catch (CsvImportException $exception) {
+            $errors = $exception->errors();
+            $message = $exception->getMessage();
 
-        // Initialize row count
-        $rowsAdded = 0;
+            if ($errors !== []) {
+                $firstError = $errors[0];
+                $location = isset($firstError['row'])
+                    ? ' Row '.(int) $firstError['row']
+                    : '';
+                $location .= ! empty($firstError['column'])
+                    ? ', column '.$firstError['column']
+                    : '';
+                $message .= $location.': '.$firstError['message'];
 
-        // Expected header format
-        $expectedHeaders = ['FIRST NAME', 'LAST NAME', 'EMAIL', 'COUNTRY', 'SPECIALITY'];
-
-        // Open and read CSV file
-        if (($handle = fopen($file->getRealPath(), 'r')) !== false) {
-            // Read the first row as headers
-            $header = fgetcsv($handle, 1000, ',');
-
-            // Validate the headers
-            if (!$header || array_map('strtoupper', $header) !== $expectedHeaders) {
-                fclose($handle);
-                return response()->json([
-                    'data' => null,
-                    'status_code' => 400,
-                    'message' => 'Invalid file format. The file must contain the following columns: FIRST NAME, LAST NAME, EMAIL, COUNTRY, SPECIALITY.',
-                    'status' => false,
-                ], 400);
+                if ($exception->totalErrors() > 1) {
+                    $message .= ' ('.$exception->totalErrors().' errors total.)';
+                }
             }
 
-            // Read each row of the CSV
-            while (($data = fgetcsv($handle, 1000, ',')) !== false) {
-                // Ensure each row has the correct number of columns
-                $data = array_map('trim', $data);
-                if (count($data) < 5) {
-                    continue; // Skip rows with missing columns
-                }
-
-                $firstname = $data[0];
-                $lastname = $data[1];
-                $email = $data[2];
-
-                // Skip rows where FIRST NAME, LAST NAME, or EMAIL is empty
-                if (empty($email)) {
-                    continue;
-                }
-
-                // Check if email already exists
-                if (CSVData::withTrashed()->where('email', $email)->exists()) {
-                    continue; // Skip if email exists
-                }
-
-                // Insert data into csv_data table
-                CSVData::create([
-                    'firstname' => $firstname,
-                    'lastname' => $lastname,
-                    'email' => $email,
-                    'country' => $data[3] ?? '',
-                    'speciality' => $data[4] ?? '',
-                    'user_id' => $user_id,
-                ]);
-
-                $rowsAdded++;
-            }
-            fclose($handle);
+            return response()->json([
+                'code' => $exception->statusCode() === 422
+                    ? 'CSV_VALIDATION_ERROR'
+                    : 'CSV_IMPORT_ERROR',
+                'data' => [
+                    'errors' => $errors,
+                    'total_errors' => $exception->totalErrors(),
+                ],
+                'errors' => $errors,
+                'total_errors' => $exception->totalErrors(),
+                'status_code' => $exception->statusCode(),
+                'message' => $message,
+                'status' => false,
+            ], $exception->statusCode(), [], JSON_INVALID_UTF8_SUBSTITUTE);
         }
+
         $data = [
             'user_name' => $user->name,
             'user_email' => $user->email,
             'entry_time' => now()->format('Y-m-d H:i:s'),
-            'data_summary' =>  $rowsAdded . " data has been added", // Show preview of data
+            'data_summary' => sprintf(
+                '%d added, %d updated, %d unchanged, %d skipped (missing email), %d phone values ignored (scientific notation)',
+                $result['rows_added'],
+                $result['rows_updated'],
+                $result['rows_unchanged'],
+                $result['rows_skipped'],
+                $result['phone_values_ignored']
+            ),
         ];
 
         // ✅ Send Email to Admin
-        if ($rowsAdded > 0) {
+        if ($result['rows_added'] > 0 || $result['rows_updated'] > 0) {
             _EmailHelper::sendEmail($data, 'emails.upload');
         }
-        // Return the count of rows added
+
+        $message = 'CSV data imported successfully.';
+        if ($result['phone_values_ignored'] > 0) {
+            $message .= ' '.$result['phone_values_ignored']
+                .' phone value(s) in scientific notation were ignored.';
+        }
+
         return response()->json([
-            'data' => ['rows_added' => $rowsAdded],
+            'data' => $result,
             'status_code' => 200,
-            'message' => 'CSV data uploaded successfully.',
+            'message' => $message,
             'status' => true,
-        ], 200);
+        ], 200, [], JSON_INVALID_UTF8_SUBSTITUTE);
     }
 
 
@@ -191,31 +184,69 @@ class CSVController extends Controller
     //     ], 200);
     // }
 
-   public function queryRow(Request $request)
+   public function queryRow(
+       Request $request,
+       ReferenceDataService $referenceData,
+       ContactSortingService $sorting
+   )
 {
     // Validate the incoming request
     $request->validate([
-        'text' => 'nullable|string',
+        'text' => 'nullable|string|max:150',
         'countries' => 'nullable|array',
         'specialties' => 'nullable|array',
+        'perPage' => 'nullable|integer|min:1|max:100',
+        'page' => 'nullable|integer|min:1',
+        ...$sorting->rules(),
     ]);
 
-    $perPage = $request->get('perPage', 30);  // Default to 30 items per page
-    $page = $request->get('page', 1);         // Default to page 1
+    $perPage = (int) $request->get('perPage', 30);
+    $page = (int) $request->get('page', 1);
+    $countries = $referenceData->expandCountries($request->input('countries', []));
+    $specialties = $referenceData->expandSpecialities($request->input('specialties', []));
+    $rows = null;
 
-    $rows = CSVData::withTrashed()
+    // Typesense provides relevance ranking and typo tolerance. Searches that
+    // include the special blank-value filters continue to use MariaDB.
+    if (
+        config('scout.driver') === 'typesense'
+        && $request->filled('text')
+        && ! $request->filled('sort_by')
+        && !in_array('', $countries, true)
+        && !in_array('', $specialties, true)
+    ) {
+        try {
+            $search = CSVData::search(trim($request->text))->withTrashed();
+
+            if ($countries) {
+                $search->whereIn('country', $this->typesenseFilterValues($countries));
+            }
+
+            if ($specialties) {
+                $search->whereIn('speciality', $this->typesenseFilterValues($specialties));
+            }
+
+            $rows = $search->paginate($perPage, 'page', $page);
+        } catch (\Throwable $exception) {
+            Log::warning('Typesense search unavailable; using database search.', [
+                'error' => $exception->getMessage(),
+            ]);
+        }
+    }
+
+    if ($rows === null) {
+        $databaseQuery = CSVData::withTrashed()
         ->where(function ($query) use ($request) {
             // Apply text search if the text is provided and not empty
             if ($request->filled('text')) {
                 $query->where('email', 'LIKE', '%' . $request->text . '%')
                     ->orWhere('firstname', 'LIKE', '%' . $request->text . '%')
-                    ->orWhere('lastname', 'LIKE', '%' . $request->text . '%');
+                    ->orWhere('lastname', 'LIKE', '%' . $request->text . '%')
+                    ->orWhere('phone', 'LIKE', '%' . $request->text . '%');
             }
         })
         // Apply country filter with special handling for empty string and NULL
-        ->when($request->filled('countries') && count($request->countries) > 0, function ($query) use ($request) {
-            $countries = $request->countries;
-
+        ->when(count($countries) > 0, function ($query) use ($countries) {
             $query->where(function ($q) use ($countries) {
                 $nonEmptyCountries = array_filter($countries, fn($c) => $c !== '');
 
@@ -229,9 +260,7 @@ class CSVController extends Controller
             });
         })
         // Apply specialty filter with special handling for empty string and NULL
-        ->when($request->filled('specialties') && count($request->specialties) > 0, function ($query) use ($request) {
-            $specialties = $request->specialties;
-
+        ->when(count($specialties) > 0, function ($query) use ($specialties) {
             $query->where(function ($q) use ($specialties) {
                 $nonEmptySpecialties = array_filter($specialties, fn($s) => $s !== '');
 
@@ -244,8 +273,17 @@ class CSVController extends Controller
                 }
             });
         })
-        ->orderBy('created_at', 'desc')  // Sort by creation date
-        ->paginate($perPage, ['*'], 'page', $page);
+        ;
+
+        $sorting->apply(
+            $databaseQuery,
+            $request->input('sort_by'),
+            $request->input('sort_direction'),
+            'created_at',
+            'desc'
+        );
+        $rows = $databaseQuery->paginate($perPage, ['*'], 'page', $page);
+    }
 
     // Check if any rows were found
     if ($rows->isEmpty()) {
@@ -285,7 +323,7 @@ class CSVController extends Controller
             'email' => 'required_without:id|email',
         ]);
         $user = Auth::user();
-        if (!in_array($user->access_type, ['RWED', 'FULL'])) {
+        if (! $user->hasPermission('contacts.delete')) {
             return response()->json([
                 'data' => null,
                 'status_code' => 404,
@@ -344,6 +382,7 @@ class CSVController extends Controller
                 'firstname' => $record->firstname,
                 'lastname' => $record->lastname,
                 'email' => $record->email,
+                'phone' => $record->phone,
                 'country' => $record->country,
                 'speciality' => $record->speciality,
                 'user_id' => Auth::id(),
@@ -394,10 +433,11 @@ class CSVController extends Controller
             'lastname' => 'sometimes|nullable|string',
             'country' => 'sometimes|nullable|string', // Allow empty string
             'speciality' => 'sometimes|nullable|string', // Allow empty string
+            'phone' => 'sometimes|nullable|string|max:32',
         ]);
         $user = Auth::user();
 
-        if (!in_array($user->access_type, ['RWE','RWED', 'FULL'])) {
+        if (! $user->hasPermission('contacts.edit')) {
             return response()->json([
                 'data' => null,
                 'status_code' => 404,
@@ -442,6 +482,7 @@ class CSVController extends Controller
                 'firstname' => $row->firstname,
                 'lastname' => $row->lastname,
                 'email' => $row->email,
+                'phone' => $row->phone,
                 'country' => $row->country,
                 'speciality' => $row->speciality,
                 'user_id' => Auth::id(),
@@ -453,10 +494,10 @@ class CSVController extends Controller
             }
 
             Log::info('Before updating row', [
-                'updates' => $request->only(['firstname', 'lastname', 'email', 'country', 'speciality']),
+                'updates' => $request->only(['firstname', 'lastname', 'email', 'phone', 'country', 'speciality']),
             ]);
 
-            $row->update($request->only(['firstname', 'lastname', 'email', 'country', 'speciality']));
+            $row->update($request->only(['firstname', 'lastname', 'email', 'phone', 'country', 'speciality']));
 
             Log::info('Before inserting user activity');
 
@@ -477,11 +518,13 @@ class CSVController extends Controller
                 'old_firstname' => $oldData['firstname'],
                 'old_lastname' => $oldData['lastname'],
                 'old_email' => $oldData['email'],
+                'old_phone' => $oldData['phone'],
                 'old_country' => $oldData['country'],
                 'old_speciality' => $oldData['speciality'],
                 'new_firstname' => $row->firstname,
                 'new_lastname' => $row->lastname,
                 'new_email' => $row->email,
+                'new_phone' => $row->phone,
                 'new_country' => $row->country,
                 'new_speciality' => $row->speciality,
             ];
@@ -518,7 +561,7 @@ class CSVController extends Controller
         ]);
         $user = Auth::user();
 
-        if (!in_array($user->access_type, ['RWED', 'FULL'])) {
+        if (! $user->hasPermission('contacts.restore')) {
             return response()->json([
                 'data' => null,
                 'status_code' => 404,
@@ -545,6 +588,7 @@ class CSVController extends Controller
             'firstname' => $row->firstname,
             'lastname' => $row->lastname,
             'email' => $row->email,
+            'phone' => $row->phone,
             'country' => $row->country,
             'speciality' => $row->speciality,
             'user_id' => Auth::id(),
@@ -588,15 +632,15 @@ class CSVController extends Controller
         // _EmailHelper::sendEmail($data, 'emails.delete');
 
     
-    $data = [
-'user_name' => $user->name,
-'user_email' => $user->email,
-'update_time' => now()->format('Y-m-d H:i:s'),
-'data_summary' => "Restored row: " . ($history->firstname ?? 'N/A') . " " . ($history->lastname ?? 'N/A') . ", Email: " . ($history->email ?? 'No email found'),
-];
+        $data = [
+            'user_name' => $user->name,
+            'user_email' => $user->email,
+            'update_time' => now()->format('Y-m-d H:i:s'),
+            'data_summary' => trim(($history->firstname ?? '').' '.($history->lastname ?? ''))
+                .', Email: '.($history->email ?? 'No email found'),
+        ];
 
-// ✅ Send Email to Admin
-_EmailHelper::sendEmail($data, 'emails.delete');
+        _EmailHelper::sendEmail($data, 'emails.delete');
       
         // Return a success response
         return response()->json([
@@ -608,15 +652,24 @@ _EmailHelper::sendEmail($data, 'emails.delete');
     }
 
 
-    public function getDataByUserId(Request $request)
+    public function getDataByUserId(Request $request, ContactSortingService $sorting)
     {
         // Validate the incoming request to ensure user_id is provided
         $request->validate([
             'user_id' => 'required|integer',
+            ...$sorting->rules(),
         ]);
 
         // Retrieve all csv_data entries for the given user_id
-        $data = CSVData::where('user_id', $request->user_id)->get();
+        $query = CSVData::where('user_id', $request->user_id);
+        $sorting->apply(
+            $query,
+            $request->input('sort_by'),
+            $request->input('sort_direction'),
+            'created_at',
+            'desc'
+        );
+        $data = $query->get();
 
         // Check if data exists
         if ($data->isEmpty()) {
@@ -709,9 +762,10 @@ _EmailHelper::sendEmail($data, 'emails.delete');
     //     }
     // }
 
-    public function exportCSVDataToExcel(Request $request)
+    public function exportCSVDataToExcel(Request $request, ReferenceDataService $referenceData)
     {
         $user = Auth::user();
+        $validated = $this->validateExportFilters($request);
 
         // if (!in_array($user->access_type, ['RW' . 'RWED', 'FULL'])) {
         //     return response()->json([
@@ -722,27 +776,17 @@ _EmailHelper::sendEmail($data, 'emails.delete');
         //     ], 404);
         // }
         try {
-            $userId = Auth::id();
-            $countries = $request->input('countries', []);
-            $specialities = $request->input('specialities', []);
-            $text = $request->input('text', '');
+            $export = $this->makeExport($validated, $referenceData);
+            $fileName = 'csv_data_'.now()->format('Ymd_His').'.csv';
+            $exportCount = $export->count();
 
-            // Pass the search and filters to the export class
-            $export = new CSVDataExport($userId, $countries, $specialities, $text);
-            $fileName = 'csv_data_' . now()->format('Ymd_His') . '.csv';
-            $exportCount = CSVData::query()
-            ->when(!empty($countries), fn ($query) => $query->whereIn('country', $countries))
-            ->when(!empty($specialities), fn ($query) => $query->whereIn('speciality', $specialities))
-            ->when(!empty($text), fn ($query) => $query->where('email', 'like', "%$text%"))
-            ->count();
-
-        // Prepare Email Data
-        $data = [
-            'user_name' => $user->name,
-            'user_email' => $user->email,
-            'export_time' => now()->format('Y-m-d H:i:s'),
-            'export_count' => $exportCount, // Send the number of records exported
-        ];
+            // Prepare Email Data
+            $data = [
+                'user_name' => $user->name,
+                'user_email' => $user->email,
+                'export_time' => now()->format('Y-m-d H:i:s'),
+                'export_count' => $exportCount,
+            ];
             // ✅ Send Email Notification to Admin
             _EmailHelper::sendEmail($data, 'emails.export');
             // Return the Excel file as a download
@@ -758,5 +802,92 @@ _EmailHelper::sendEmail($data, 'emails.delete');
                 'status' => false,
             ], 500);
         }
+    }
+
+    public function exportCount(Request $request, ReferenceDataService $referenceData)
+    {
+        $validated = $this->validateExportFilters($request);
+
+        try {
+            $total = $this->hasExportCriteria($validated)
+                ? $this->makeExport($validated, $referenceData)->count()
+                : 0;
+
+            return response()->json([
+                'data' => ['total' => $total],
+                'status_code' => 200,
+                'message' => 'Export contact count retrieved successfully.',
+                'status' => true,
+            ]);
+        } catch (\Exception $e) {
+            Log::error('Export count failed: '.$e->getMessage(), ['trace' => $e->getTraceAsString()]);
+
+            return response()->json([
+                'data' => null,
+                'status_code' => 500,
+                'message' => 'Unable to calculate the export contact count.',
+                'status' => false,
+            ], 500);
+        }
+    }
+
+    private function validateExportFilters(Request $request): array
+    {
+        return $request->validate([
+            'countries' => 'nullable|array',
+            'countries.*' => 'string|max:255',
+            'specialities' => 'nullable|array',
+            'specialities.*' => 'string|max:255',
+            'specialties' => 'nullable|array',
+            'specialties.*' => 'string|max:255',
+            'text' => 'nullable|string|max:150',
+            'include_tag_ids' => 'nullable|array|max:100',
+            'include_tag_ids.*' => ['integer', 'distinct', Rule::exists('tags', 'id')],
+            'exclude_tag_ids' => 'nullable|array|max:100',
+            'exclude_tag_ids.*' => ['integer', 'distinct', Rule::exists('tags', 'id')],
+            'sort_by' => 'nullable|string|in:'.implode(',', ContactSortingService::FIELDS),
+            'sort_direction' => 'nullable|string|in:asc,desc',
+        ]);
+    }
+
+    private function makeExport(array $validated, ReferenceDataService $referenceData): CSVDataExport
+    {
+        return new CSVDataExport(
+            (int) Auth::id(),
+            $referenceData->expandCountries($validated['countries'] ?? []),
+            $referenceData->expandSpecialities(array_merge(
+                $validated['specialities'] ?? [],
+                $validated['specialties'] ?? []
+            )),
+            trim($validated['text'] ?? ''),
+            array_map('intval', $validated['include_tag_ids'] ?? []),
+            array_map('intval', $validated['exclude_tag_ids'] ?? []),
+            $validated['sort_by'] ?? 'created_at',
+            $validated['sort_direction'] ?? 'desc',
+            Auth::user()?->microsoft_tenant_id,
+            true
+        );
+    }
+
+    private function hasExportCriteria(array $validated): bool
+    {
+        return trim($validated['text'] ?? '') !== ''
+            || ($validated['countries'] ?? []) !== []
+            || ($validated['specialities'] ?? []) !== []
+            || ($validated['specialties'] ?? []) !== []
+            || ($validated['include_tag_ids'] ?? []) !== []
+            || ($validated['exclude_tag_ids'] ?? []) !== [];
+    }
+
+    /**
+     * Laravel Scout does not quote Typesense whereIn values. Backticks are
+     * required for aliases containing commas, slashes, parentheses, or spaces.
+     */
+    private function typesenseFilterValues(array $values): array
+    {
+        return array_map(
+            fn ($value) => '`' . str_replace('`', '\\`', $value) . '`',
+            $values
+        );
     }
 }

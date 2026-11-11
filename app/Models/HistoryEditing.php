@@ -17,6 +17,7 @@ class HistoryEditing extends Model
         'firstname',
         'lastname',
         'email',
+        'phone',
         'country',
         'speciality',
         'user_id',
